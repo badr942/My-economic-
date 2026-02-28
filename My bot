@@ -1,0 +1,682 @@
+#!/usr/bin/env python3
+"""
+╔══════════════════════════════════════════════════════╗
+║     بوت تلغرام - الخبير الاقتصادي الإسلامي          ║
+║  أسواق سعودية | أمريكية | عملات رقمية               ║
+╚══════════════════════════════════════════════════════╝
+
+المتطلبات:
+    pip install python-telegram-bot anthropic yfinance pandas numpy requests
+
+الإعداد:
+    1. أنشئ بوت من @BotFather في تلغرام واحصل على TOKEN
+    2. احصل على Claude API Key من console.anthropic.com
+    3. ضع المفاتيح في متغيرات البيئة أو مباشرة في الكود
+"""
+
+import os
+import json
+import logging
+import asyncio
+import re
+from datetime import datetime
+from typing import Optional
+import requests
+
+import anthropic
+import yfinance as yf
+import pandas as pd
+import numpy as np
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    BotCommand,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+    filters,
+)
+from telegram.constants import ParseMode
+
+# ═══════════════════════════════════════════════════════
+#                      الإعدادات
+# ═══════════════════════════════════════════════════════
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "8655325352:AAFYL_q2GF6qk-b4I9tWzV9jl6G1cthF_Gs")
+CLAUDE_API_KEY  = os.getenv("CLAUDE_API_KEY",  "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")
+NEWS_API_KEY    = os.getenv("NEWS_API_KEY",    "")  # اختياري من newsapi.org
+
+logging.basicConfig(
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+logger = logging.getLogger(__name__)
+
+claude = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+
+# ═══════════════════════════════════════════════════════
+#         قاعدة بيانات المستخدمين (في الذاكرة)
+#    في الإنتاج: استبدل بـ SQLite أو Redis
+# ═══════════════════════════════════════════════════════
+user_portfolios: dict = {}   # {user_id: [{symbol, qty, buy_price, buy_date}]}
+price_alerts: dict   = {}    # {user_id: [{symbol, target, direction}]}
+
+
+# ═══════════════════════════════════════════════════════
+#                   الحكم الشرعي
+# ═══════════════════════════════════════════════════════
+HARAM_SECTORS = [
+    "Banks", "Financial Services", "Insurance",
+    "Beverages—Brewers", "Beverages—Wineries",
+    "Gambling", "Adult Entertainment", "Tobacco",
+    "Defense & Space", "Aerospace & Defense",
+]
+
+SHARIAH_OVERRIDE = {
+    "2222.SR": ("متوافق",      "✅ أرامكو السعودية: شركة نفط وغاز متوافقة."),
+    "1120.SR": ("مشبوه",       "⚠️ مصرف الراجحي: بنك إسلامي لكن يوجد جدل فقهي."),
+    "1010.SR": ("غير متوافق",  "❌ البنك الأهلي: بنك ربوي تقليدي."),
+}
+
+def check_shariah(info: dict, symbol: str) -> dict:
+    """تقييم شرعي مبسط للسهم"""
+    sym = symbol.upper()
+    if sym in SHARIAH_OVERRIDE:
+        verdict, reason = SHARIAH_OVERRIDE[sym]
+        return {"verdict": verdict, "reason": reason}
+
+    sector   = info.get("sector", "")   or ""
+    industry = info.get("industry", "") or ""
+    verdict  = "متوافق"
+
+    for h in HARAM_SECTORS:
+        if h.lower() in sector.lower() or h.lower() in industry.lower():
+            verdict = "غير متوافق"
+            break
+
+    reasons = {
+        "متوافق":
+            "✅ السهم يبدو متوافقاً مع الشريعة الإسلامية بناءً على قطاع نشاطه الرئيسي.",
+        "مشبوه":
+            "⚠️ قطاع النشاط قد يحتوي أنشطة مختلطة. يُنصح بمراجعة عالم شرعي متخصص.",
+        "غير متوافق":
+            "❌ السهم في قطاع محرم (بنوك ربوية / كحول / قمار / تبغ / تسليح).",
+    }
+    return {"verdict": verdict, "reason": reasons[verdict]}
+
+
+# ═══════════════════════════════════════════════════════
+#                  جلب بيانات السهم
+# ═══════════════════════════════════════════════════════
+def get_stock_data(symbol: str) -> Optional[dict]:
+    """جلب بيانات لحظية وتاريخية للسهم مع المؤشرات التقنية"""
+    try:
+        ticker = yf.Ticker(symbol)
+        info   = ticker.info
+        hist   = ticker.history(period="3mo", interval="1d")
+
+        if hist.empty or not info:
+            return None
+
+        close = hist["Close"]
+        vol   = hist["Volume"]
+
+        # ─── RSI ────────────────────────────────────────
+        delta = close.diff()
+        gain  = delta.clip(lower=0).rolling(14).mean()
+        loss  = (-delta.clip(upper=0)).rolling(14).mean()
+        rs    = gain / loss
+        rsi   = float((100 - 100 / (1 + rs)).iloc[-1])
+
+        # ─── المتوسطات المتحركة ──────────────────────────
+        ma20 = float(close.rolling(20).mean().iloc[-1])
+        ma50 = float(close.rolling(50).mean().iloc[-1]) if len(close) >= 50 else None
+
+        # ─── بولينجر باندز ───────────────────────────────
+        std20    = float(close.rolling(20).std().iloc[-1])
+        bb_upper = ma20 + 2 * std20
+        bb_lower = ma20 - 2 * std20
+
+        # ─── MACD ────────────────────────────────────────
+        ema12        = close.ewm(span=12).mean()
+        ema26        = close.ewm(span=26).mean()
+        macd         = float((ema12 - ema26).iloc[-1])
+        macd_signal  = float((ema12 - ema26).ewm(span=9).mean().iloc[-1])
+
+        # ─── الدعم والمقاومة (20 يوم) ──────────────────
+        support    = float(close.rolling(20).min().iloc[-1])
+        resistance = float(close.rolling(20).max().iloc[-1])
+
+        current_price = (
+            info.get("currentPrice")
+            or info.get("regularMarketPrice")
+            or float(close.iloc[-1])
+        )
+        prev_close = info.get("previousClose") or (float(close.iloc[-2]) if len(close) > 1 else current_price)
+        change_pct = ((current_price - prev_close) / prev_close) * 100
+
+        return {
+            "symbol":        symbol.upper(),
+            "name":          info.get("longName") or info.get("shortName", symbol),
+            "sector":        info.get("sector",   "غير محدد"),
+            "industry":      info.get("industry", "غير محدد"),
+            "current_price": current_price,
+            "prev_close":    prev_close,
+            "change_pct":    change_pct,
+            "market_cap":    info.get("marketCap"),
+            "pe_ratio":      info.get("trailingPE"),
+            "volume":        int(vol.iloc[-1])  if not vol.empty else 0,
+            "avg_volume":    int(vol.mean()),
+            "rsi":           rsi,
+            "ma20":          ma20,
+            "ma50":          ma50,
+            "macd":          macd,
+            "macd_signal":   macd_signal,
+            "bb_upper":      bb_upper,
+            "bb_lower":      bb_lower,
+            "support":       support,
+            "resistance":    resistance,
+            "currency":      info.get("currency", "USD"),
+            "exchange":      info.get("exchange", ""),
+            "info":          info,
+        }
+    except Exception as e:
+        logger.error(f"خطأ في جلب بيانات {symbol}: {e}")
+        return None
+
+
+# ═══════════════════════════════════════════════════════
+#                  جلب أخبار السهم
+# ═══════════════════════════════════════════════════════
+def get_stock_news(symbol: str, company_name: str) -> list[str]:
+    """جلب آخر الأخبار"""
+    headlines = []
+    try:
+        if NEWS_API_KEY:
+            url = (
+                f"https://newsapi.org/v2/everything"
+                f"?q={company_name}&sortBy=publishedAt&pageSize=5"
+                f"&language=en&apiKey={NEWS_API_KEY}"
+            )
+            r = requests.get(url, timeout=5)
+            if r.ok:
+                for a in r.json().get("articles", []):
+                    headlines.append(a.get("title", ""))
+        else:
+            news = yf.Ticker(symbol).news or []
+            for n in news[:5]:
+                headlines.append(n.get("title", ""))
+    except Exception as e:
+        logger.warning(f"أخبار: {e}")
+    return headlines
+
+
+# ═══════════════════════════════════════════════════════
+#            التحليل الكامل عبر Claude
+# ═══════════════════════════════════════════════════════
+def analyze_with_claude(data: dict, shariah: dict, news: list[str]) -> str:
+    news_text = "\n".join(f"- {h}" for h in news) if news else "لا توجد أخبار متاحة."
+
+    prompt = f"""
+أنت خبير مالي إسلامي. قدّم تحليلاً احترافياً شاملاً بالعربية للسهم:
+
+━━━ بيانات السهم ━━━
+الرمز: {data['symbol']} | الاسم: {data['name']}
+السعر الحالي: {data['current_price']:.2f} {data['currency']}
+التغيير اليومي: {data['change_pct']:+.2f}%
+القطاع: {data['sector']} | الصناعة: {data['industry']}
+القيمة السوقية: {f"{data['market_cap']:,}" if data['market_cap'] else 'N/A'}
+P/E Ratio: {data['pe_ratio'] or 'N/A'}
+
+━━━ المؤشرات التقنية ━━━
+RSI (14): {data['rsi']:.1f}
+MA20: {data['ma20']:.2f} | MA50: {f"{data['ma50']:.2f}" if data['ma50'] else 'N/A'}
+MACD: {data['macd']:.3f} | Signal: {data['macd_signal']:.3f}
+Bollinger Upper: {data['bb_upper']:.2f} | Lower: {data['bb_lower']:.2f}
+الدعم: {data['support']:.2f} | المقاومة: {data['resistance']:.2f}
+الحجم: {data['volume']:,} | متوسط الحجم: {data['avg_volume']:,}
+
+━━━ الأخبار ━━━
+{news_text}
+
+━━━ التقييم الشرعي ━━━
+الحكم: {shariah['verdict']}
+{shariah['reason']}
+
+━━━ المطلوب منك ━━━
+قدّم تحليلاً منظماً يشمل:
+1. **ملخص سريع** (3 أسطر)
+2. **التحليل الفني** (RSI، المتوسطات، MACD، الزخم العام)
+3. **تحليل الأخبار** وتأثيرها على السهم
+4. **الحكم الشرعي** مع التفصيل
+5. **نقطة الدخول المقترحة** (السعر الأمثل للشراء)
+6. **الهدف الأول والثاني** (Take Profit 1 & 2)
+7. **وقف الخسارة** (Stop Loss) مع التبرير
+8. **التوصية النهائية**: شراء قوي / شراء / انتظار / تجنب — مع التبرير المفصل
+
+⚠️ أضف إخلاء المسؤولية في النهاية.
+"""
+
+    resp = claude.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1500,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return resp.content[0].text
+
+
+def compare_with_claude(d1: dict, d2: dict) -> str:
+    prompt = f"""
+قارن بين السهمين بالعربية بشكل احترافي:
+
+السهم الأول: {d1['symbol']} - {d1['name']}
+السعر: {d1['current_price']:.2f} | التغيير: {d1['change_pct']:+.2f}%
+RSI: {d1['rsi']:.1f} | P/E: {d1['pe_ratio'] or 'N/A'} | القطاع: {d1['sector']}
+الدعم: {d1['support']:.2f} | المقاومة: {d1['resistance']:.2f}
+
+السهم الثاني: {d2['symbol']} - {d2['name']}
+السعر: {d2['current_price']:.2f} | التغيير: {d2['change_pct']:+.2f}%
+RSI: {d2['rsi']:.1f} | P/E: {d2['pe_ratio'] or 'N/A'} | القطاع: {d2['sector']}
+الدعم: {d2['support']:.2f} | المقاومة: {d2['resistance']:.2f}
+
+قدّم:
+1. مقارنة تقنية واضحة
+2. مقارنة أساسية (التقييم، الحجم، القطاع)
+3. الأفضل للاستثمار الآن ولماذا؟
+4. جدول مقارنة مختصر نصي
+"""
+    resp = claude.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=1200,
+        messages=[{"role": "user", "content": prompt}],
+    )
+    return resp.content[0].text
+
+
+def ask_claude_general(question: str) -> str:
+    resp = claude.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=800,
+        system=(
+            "أنت خبير اقتصادي ومستشار مالي إسلامي متخصص في الأسواق السعودية والأمريكية "
+            "والعملات الرقمية. تحدث دائماً بالعربية. كن دقيقاً واحترافياً وموجزاً."
+        ),
+        messages=[{"role": "user", "content": question}],
+    )
+    return resp.content[0].text
+
+
+# ═══════════════════════════════════════════════════════
+#              القاموس المالي
+# ═══════════════════════════════════════════════════════
+GLOSSARY = {
+    "rsi":         "مؤشر القوة النسبية: يقيس زخم السعر. فوق 70 = ذروة شراء ⚠️، تحت 30 = ذروة بيع 🎯.",
+    "macd":        "MACD: يقيس الفرق بين متوسطين أسيين. قطع الإشارة للأعلى = إشارة شراء محتملة.",
+    "pe":          "مضاعف الربحية P/E: السعر ÷ الربحية. يوضح كم يدفع المستثمر مقابل كل وحدة ربح.",
+    "support":     "الدعم: مستوى سعري يرتد منه السهم للأعلى تاريخياً. كسره = إشارة هبوط.",
+    "resistance":  "المقاومة: مستوى يصعب تجاوزه. اختراقه = إشارة صعود قوية.",
+    "ma":          "المتوسط المتحرك: متوسط أسعار الإغلاق على فترة. يحدد الاتجاه العام.",
+    "bollinger":   "بولينجر باندز: قنوات حول MA20. لمس الحد العلوي قد يعني تشبع شراء.",
+    "ipo":         "الطرح العام الأولي: أول إدراج للشركة في البورصة لجمع التمويل.",
+    "etf":         "صندوق المؤشر: يتتبع مؤشراً كـ S&P 500 ويُتداول كسهم عادي.",
+    "stop loss":   "وقف الخسارة: أمر بيع تلقائي عند سعر محدد للحد من الخسائر.",
+    "take profit": "جني الأرباح: أمر بيع عند السعر المستهدف لتحقيق الأرباح.",
+    "volume":      "حجم التداول: عدد الأسهم المتداولة. الحجم العالي يؤكد قوة الحركة.",
+    "market cap":  "القيمة السوقية: السعر × عدد الأسهم. تعبّر عن حجم الشركة.",
+    "eps":         "ربحية السهم EPS: صافي الأرباح ÷ عدد الأسهم. مؤشر كفاءة الشركة.",
+    "yield":       "العائد: نسبة توزيعات الأرباح إلى سعر السهم. مهم للمستثمرين الباحثين عن دخل.",
+}
+
+
+# ═══════════════════════════════════════════════════════
+#                   أوامر البوت
+# ═══════════════════════════════════════════════════════
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        [
+            InlineKeyboardButton("📊 تحليل سهم",    callback_data="menu_analyze"),
+            InlineKeyboardButton("🔍 مقارنة سهمين", callback_data="menu_compare"),
+        ],
+        [
+            InlineKeyboardButton("💼 محفظتي",        callback_data="menu_portfolio"),
+            InlineKeyboardButton("🔔 تنبيهات السعر", callback_data="menu_alerts"),
+        ],
+        [
+            InlineKeyboardButton("📚 قاموس مالي",    callback_data="menu_glossary"),
+            InlineKeyboardButton("❓ اسأل الخبير",   callback_data="menu_ask"),
+        ],
+    ]
+    await update.message.reply_text(
+        "🌟 *مرحباً في الخبير الاقتصادي الإسلامي* 🌟\n\n"
+        "متخصص في:\n"
+        "🇸🇦 الأسواق السعودية (تداول)\n"
+        "🇺🇸 الأسواق الأمريكية (NYSE/NASDAQ)\n"
+        "₿ العملات الرقمية\n"
+        "☪️ الاستثمار الحلال\n\n"
+        "📌 أرسل رمز السهم مباشرة للتحليل الفوري\n"
+        "مثال: `AAPL` أو `2222.SR` أو `BTC-USD`",
+        parse_mode=ParseMode.MARKDOWN,
+        reply_markup=InlineKeyboardMarkup(keyboard),
+    )
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 *دليل الاستخدام*\n\n"
+        "`AAPL` أو `2222.SR` — تحليل فوري\n"
+        "`/analyze AAPL` — تحليل تفصيلي\n"
+        "`/compare AAPL MSFT` — مقارنة سهمين\n"
+        "`/portfolio` — عرض محفظتك\n"
+        "`/add_stock AAPL 10 180` — إضافة سهم (رمز، كمية، سعر الشراء)\n"
+        "`/alert AAPL 200 up` — تنبيه عند وصول السعر\n"
+        "`/glossary rsi` — شرح مصطلح مالي\n"
+        "`/ask سؤالك` — اسأل الخبير أي سؤال\n",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def analyze_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "📌 الاستخدام: `/analyze رمزالسهم`\nمثال: `/analyze AAPL`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    await _do_analysis(update, context, context.args[0].upper())
+
+
+async def _do_analysis(update: Update, context: ContextTypes.DEFAULT_TYPE, symbol: str):
+    msg = await update.message.reply_text(f"⏳ جاري جلب بيانات {symbol}...")
+
+    data = get_stock_data(symbol)
+    if not data:
+        await msg.edit_text(
+            f"❌ لم أجد بيانات للرمز *{symbol}*\n"
+            "تأكد من الرمز وحاول مجدداً.\n"
+            "الأسهم السعودية تنتهي بـ `.SR` مثل `2222.SR`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    shariah = check_shariah(data["info"], symbol)
+    news    = get_stock_news(symbol, data["name"])
+
+    await msg.edit_text(f"🧠 جاري التحليل الذكي لـ *{symbol}*...", parse_mode=ParseMode.MARKDOWN)
+    analysis = analyze_with_claude(data, shariah, news)
+
+    arrow  = "🟢" if data["change_pct"] >= 0 else "🔴"
+    header = (
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"{arrow} *{data['name']}* `{data['symbol']}`\n"
+        f"💵 *{data['current_price']:.2f} {data['currency']}*  {data['change_pct']:+.2f}%\n"
+        f"📊 RSI: {data['rsi']:.1f}  |  {data['sector']}\n"
+        f"🕌 الشريعة: *{shariah['verdict']}*\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    )
+
+    full = header + analysis
+    for i in range(0, len(full), 4000):
+        chunk = full[i : i + 4000]
+        if i == 0:
+            await msg.edit_text(chunk, parse_mode=ParseMode.MARKDOWN)
+        else:
+            await update.message.reply_text(chunk, parse_mode=ParseMode.MARKDOWN)
+
+
+async def compare_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 2:
+        await update.message.reply_text(
+            "📌 الاستخدام: `/compare رمز1 رمز2`\nمثال: `/compare AAPL MSFT`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    s1, s2 = context.args[0].upper(), context.args[1].upper()
+    msg = await update.message.reply_text(f"⏳ جاري مقارنة {s1} و {s2}...")
+    d1  = get_stock_data(s1)
+    d2  = get_stock_data(s2)
+    if not d1 or not d2:
+        await msg.edit_text("❌ لم أتمكن من جلب بيانات أحد السهمين.")
+        return
+    result = compare_with_claude(d1, d2)
+    await msg.edit_text(
+        f"🔍 *مقارنة {s1} vs {s2}*\n\n{result}",
+        parse_mode=ParseMode.MARKDOWN,
+    )
+
+
+async def portfolio_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid  = update.effective_user.id
+    port = user_portfolios.get(uid, [])
+    if not port:
+        await update.message.reply_text(
+            "💼 محفظتك فارغة!\n"
+            "أضف سهماً: `/add_stock AAPL 10 180`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+
+    lines = ["💼 *محفظتك الاستثمارية*\n━━━━━━━━━━━━━━━━━━━━━━"]
+    total_cost = total_value = 0.0
+
+    for item in port:
+        d = get_stock_data(item["symbol"])
+        if not d:
+            continue
+        cost  = item["qty"] * item["buy_price"]
+        value = item["qty"] * d["current_price"]
+        pnl   = value - cost
+        pct   = (pnl / cost) * 100
+        lines.append(
+            f"\n{'📈' if pnl >= 0 else '📉'} *{item['symbol']}* ×{item['qty']}\n"
+            f"   شراء: {item['buy_price']:.2f}  →  حالي: {d['current_price']:.2f}\n"
+            f"   ربح/خسارة: *{pnl:+.2f}* ({pct:+.1f}%)"
+        )
+        total_cost  += cost
+        total_value += value
+
+    total_pnl = total_value - total_cost
+    total_pct = (total_pnl / total_cost * 100) if total_cost else 0
+    lines += [
+        "\n━━━━━━━━━━━━━━━━━━━━━━",
+        f"💰 التكلفة: {total_cost:.2f}",
+        f"💵 القيمة الحالية: {total_value:.2f}",
+        f"{'✅' if total_pnl >= 0 else '❌'} إجمالي: *{total_pnl:+.2f}* ({total_pct:+.1f}%)",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.MARKDOWN)
+
+
+async def add_stock_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "📌 الاستخدام: `/add_stock رمز الكمية سعرالشراء`\n"
+            "مثال: `/add_stock AAPL 10 180.5`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    try:
+        symbol    = context.args[0].upper()
+        qty       = float(context.args[1])
+        buy_price = float(context.args[2])
+        uid       = update.effective_user.id
+        user_portfolios.setdefault(uid, []).append({
+            "symbol":    symbol,
+            "qty":       qty,
+            "buy_price": buy_price,
+            "buy_date":  datetime.now().strftime("%Y-%m-%d"),
+        })
+        await update.message.reply_text(
+            f"✅ تمت إضافة *{qty}* سهم من *{symbol}* بسعر *{buy_price}* إلى محفظتك.",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except ValueError:
+        await update.message.reply_text("❌ الأرقام غير صحيحة، حاول مجدداً.")
+
+
+async def alert_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if len(context.args) < 3:
+        await update.message.reply_text(
+            "📌 الاستخدام: `/alert رمز السعر up/down`\n"
+            "مثال: `/alert AAPL 200 up`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    try:
+        symbol    = context.args[0].upper()
+        target    = float(context.args[1])
+        direction = context.args[2].lower()
+        uid       = update.effective_user.id
+        price_alerts.setdefault(uid, []).append(
+            {"symbol": symbol, "target": target, "direction": direction}
+        )
+        dir_ar = "يصعد إلى" if direction == "up" else "ينزل إلى"
+        await update.message.reply_text(
+            f"🔔 تم ضبط التنبيه: سأخبرك حين {dir_ar} *{symbol}* → *{target}*",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    except ValueError:
+        await update.message.reply_text("❌ تأكد من صحة القيم المدخلة.")
+
+
+async def glossary_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        terms = " | ".join(GLOSSARY.keys())
+        await update.message.reply_text(
+            f"📚 *القاموس المالي*\n\n{terms}\n\nمثال: `/glossary rsi`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    term = " ".join(context.args).lower()
+    if term in GLOSSARY:
+        await update.message.reply_text(
+            f"📖 *{term.upper()}*\n\n{GLOSSARY[term]}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+    else:
+        answer = ask_claude_general(f"اشرح مصطلح '{term}' المالي بالعربية بشكل مبسط في فقرة واحدة.")
+        await update.message.reply_text(
+            f"📖 *{term}*\n\n{answer}",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+
+
+async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not context.args:
+        await update.message.reply_text(
+            "📌 الاستخدام: `/ask سؤالك هنا`",
+            parse_mode=ParseMode.MARKDOWN,
+        )
+        return
+    msg    = await update.message.reply_text("🤔 جاري البحث عن إجابة...")
+    answer = ask_claude_general(" ".join(context.args))
+    await msg.edit_text(f"💬 *الإجابة:*\n\n{answer}", parse_mode=ParseMode.MARKDOWN)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """معالج الرسائل النصية — رمز سهم أو سؤال عام"""
+    text = update.message.text.strip()
+    # التحقق من رمز سهم
+    if re.match(r'^[A-Za-z0-9.\-]{1,12}$', text) and len(text.strip()) >= 1:
+        await _do_analysis(update, context, text.upper())
+    else:
+        msg    = await update.message.reply_text("🤔 جاري التفكير...")
+        answer = ask_claude_general(text)
+        await msg.edit_text(f"💬 {answer}", parse_mode=ParseMode.MARKDOWN)
+
+
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data  = query.data
+
+    responses = {
+        "menu_analyze":   "📊 أرسل رمز السهم مباشرة\nمثال: `AAPL` أو `2222.SR` أو `BTC-USD`",
+        "menu_compare":   "🔍 أرسل: `/compare رمز1 رمز2`\nمثال: `/compare AAPL TSLA`",
+        "menu_alerts":    "🔔 أرسل: `/alert رمز السعر up/down`\nمثال: `/alert AAPL 200 up`",
+        "menu_ask":       "❓ أرسل: `/ask سؤالك` أو اكتب سؤالك مباشرة.",
+        "menu_glossary":  "📚 أرسل: `/glossary rsi` أو أي مصطلح مالي.",
+    }
+
+    if data == "menu_portfolio":
+        await portfolio_command(update, context)
+    elif data in responses:
+        await query.message.reply_text(responses[data], parse_mode=ParseMode.MARKDOWN)
+
+
+# ═══════════════════════════════════════════════════════
+#           وظيفة تحقق تنبيهات الأسعار
+# ═══════════════════════════════════════════════════════
+async def check_alerts_job(context: ContextTypes.DEFAULT_TYPE):
+    for uid, alerts in list(price_alerts.items()):
+        triggered, remaining = [], []
+        for a in alerts:
+            d = get_stock_data(a["symbol"])
+            if not d:
+                remaining.append(a)
+                continue
+            price = d["current_price"]
+            hit = (a["direction"] == "up"   and price >= a["target"]) or \
+                  (a["direction"] == "down"  and price <= a["target"])
+            (triggered if hit else remaining).append(a if not hit else (a, price))
+        price_alerts[uid] = remaining
+        for a, price in triggered:
+            try:
+                await context.bot.send_message(
+                    chat_id=uid,
+                    text=(
+                        f"🚨 *تنبيه السعر!*\n\n"
+                        f"وصل *{a['symbol']}* إلى *{price:.2f}*\n"
+                        f"الهدف كان: {a['target']} ({a['direction']})"
+                    ),
+                    parse_mode=ParseMode.MARKDOWN,
+                )
+            except Exception:
+                pass
+
+
+# ═══════════════════════════════════════════════════════
+#                     التشغيل الرئيسي
+# ═══════════════════════════════════════════════════════
+def main():
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start",      start))
+    app.add_handler(CommandHandler("help",       help_command))
+    app.add_handler(CommandHandler("analyze",    analyze_command))
+    app.add_handler(CommandHandler("compare",    compare_command))
+    app.add_handler(CommandHandler("portfolio",  portfolio_command))
+    app.add_handler(CommandHandler("add_stock",  add_stock_command))
+    app.add_handler(CommandHandler("alert",      alert_command))
+    app.add_handler(CommandHandler("glossary",   glossary_command))
+    app.add_handler(CommandHandler("ask",        ask_command))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+
+    # تحقق من التنبيهات كل 15 دقيقة
+    app.job_queue.run_repeating(check_alerts_job, interval=900, first=30)
+
+    async def post_init(application: Application):
+        await application.bot.set_my_commands([
+            BotCommand("start",     "الصفحة الرئيسية"),
+            BotCommand("analyze",   "تحليل سهم"),
+            BotCommand("compare",   "مقارنة سهمين"),
+            BotCommand("portfolio", "محفظتي"),
+            BotCommand("add_stock", "إضافة سهم للمحفظة"),
+            BotCommand("alert",     "ضبط تنبيه سعر"),
+            BotCommand("glossary",  "قاموس مالي"),
+            BotCommand("ask",       "اسأل الخبير"),
+            BotCommand("help",      "المساعدة"),
+        ])
+
+    app.post_init = post_init
+    logger.info("🚀 البوت يعمل...")
+    app.run_polling(drop_pending_updates=True)
+
+
+if __name__ == "__main__":
+    main()
